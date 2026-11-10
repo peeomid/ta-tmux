@@ -1,0 +1,480 @@
+#!/bin/bash
+# ta - tmux agents. A small herdr-like layer on plain tmux.
+# Agents run in NORMAL interactive mode, 1 tmux window each. You can switch
+# to any window and type. Agents (and you) use this script to start, list,
+# read, message and wait on each other. Works with any harness (claude,
+# codex, agy, ...). No hooks, no daemon, no network: only tmux commands.
+#
+# Status is GUESSED from the visible screen (herdr gets it from the agent
+# itself; tmux cannot). Tune the patterns with TA_WORKING_RE / TA_BLOCKED_RE.
+#
+# Bash 3.2 safe (macOS /bin/bash).
+set -euo pipefail
+
+# Checked on claude 2.1.317, codex 0.164.0, agy 1.4.12.
+#   claude working: "✶ Whirring… (4s · thinking)"   done: "✻ Baked for 5s · done"
+#   codex  working: "• Working (3s • esc to interrupt)"   done: "Worked for 6s"
+#   agy    working: "⣯  Generating..." + "esc to cancel"
+#   agy    blocked: "requires permission ... ↑/↓ Navigate · enter Confirm"
+# Blocked is checked first (Claude's permission box also says "Esc to cancel").
+TA_WORKING_RE="${TA_WORKING_RE:-^(✢|✳|✶|✻|✽|·|\*) [[:alpha:]]+… \(|esc to interrupt|esc to cancel}"
+TA_BLOCKED_RE="${TA_BLOCKED_RE:-Do you want to |Would you like to |Allow (this|command|once)|Approve|\[y/n\]|\(y/n\)|don.t ask again|Press enter to confirm|requires permission|enter Confirm|trust this folder|Update now|esc skip}"
+
+# Use another tmux server for tests: TA_SOCKET=test ta ls
+T() { tmux ${TA_SOCKET:+-L "$TA_SOCKET"} "$@"; }
+
+# Registry of agents (survives a tmux crash or a reboot).
+# $0 can be a symlink (ln -s .../ta ~/.local/bin/ta). The python files are next to
+# the REAL script, so follow the link. (macOS bash 3.2 has no 'readlink -f'.)
+TA_BIN="$(python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+STATE="${TA_STATE:-$HOME/.local/state/ta}"
+REG="$STATE/agents${TA_SOCKET:+-$TA_SOCKET}.tsv"
+mkdir -p "$STATE"; touch "$REG"
+
+die() { echo "ta: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+ta - tmux agents (interactive sessions, any harness)
+
+GET IN / GET OUT OF TMUX
+  ta                       Get in (any terminal), like `herdr`. No tmux yet: build
+                           the workspaces again from the last snapshot (agents
+                           typed, not started), else make workspace "main".
+  ta attach [name]         Same, then open workspace <name> (made if missing).
+  Ctrl-b d                 Get out (detach). Agents keep running; `ta` = back in.
+  Ctrl-b ?                 All keys (workspace / tab / pane).
+  exit (in a pane)         Close that pane only. Ctrl-b & = close the tab.
+  tmux kill-server         Stop ALL of tmux and its agents. Last resort.
+  ta doctor                Check tmux, python3 and agent CLIs are installed.
+  ta fix  (Ctrl-b F)       Layout looks broken: 1 sidebar per tab, right width,
+                           tabs fit the terminal. Agents are not touched.
+  ta help                  This help.
+
+AGENTS
+  ta run [-n name] [-C dir] [-s session] [--keep] <harness|cmd> [task]
+        Start an agent in a new window. claude/codex/agy get the task as
+        their first prompt and stay interactive. Prints the pane id (%N).
+  ta ls [--all]            List agents: id, place, harness, status, parent.
+  ta top                   Live list (refresh every 2 s). q / Esc to quit.
+  ta status <target>       working | blocked | idle | exited. Refused if no agent
+                           runs in the pane (a bare shell).
+  ta read <target> [N]     Screen text + last N lines of history (default 60).
+  ta send [--wait] <target> <text>
+                           Type a message + Enter. Blocked targets are not refused.
+                           or has no agent (a bare shell would RUN the text).
+                           --wait: then wait until it is done.
+  ta wait <target> [secs]  Wait until the target stops working (default 180).
+  ta stop [--force] <target>
+                           Press Esc (interrupt the current turn). Refused if the
+                           target is blocked (guard removed; --force is ignored).
+                           Agents must NEVER use --force.
+  ta kill <target>         Close the window (and forget the agent).
+  ta agents                Registry: name, session, harness, session id.
+  ta restore [--dry-run]   After a tmux crash or reboot: start every agent
+                           in the registry again, resumed by its session id.
+  ta ws <cmd>              Workspaces (herdr-like): ls, new, save, snapshots,
+                           restore, import-herdr, bar. `ta ws` for help.
+
+herdr-style commands (text output; add --json for scripts):
+  ta agent <cmd>           list, get, read, send-keys, prompt, wait, rename,
+                           focus, attach, start.   `ta agent` for help.
+  ta workspace <cmd>       list, create, get, focus, rename, close.
+                           Workspace ref: $id, order number or label. A pure
+                           number is the order number first, then a label.
+  ta tab <cmd>             list, create, get, focus, rename, close.
+  ta pane <cmd>            list, current, get, split, focus, zoom, rename,
+                           close, read, send-text, send-keys, wait-output.
+
+<target> = pane id (%12), or window name, or session:window.
+Inside an agent, $TMUX_PANE is its own id; children get $TA_PARENT.
+EOF
+}
+
+# --- target lookup -------------------------------------------------------
+resolve() {
+  local t="$1"
+  case "$t" in
+    %*) T display -p -t "$t" '#{pane_id}' 2>/dev/null || die "no pane $t" ;;
+    *)
+      local hits
+      hits=$(T list-panes -a -F '#{pane_id} #{session_name}:#{window_name} #{window_name} #{@ta_name}' \
+             | awk -v t="$t" '$2==t || $3==t || $4==t {print $1}')
+      [ -n "$hits" ] || die "no agent named '$t'"
+      [ "$(echo "$hits" | wc -l | tr -d ' ')" = 1 ] || die "'$t' matches more than 1 pane; use the %id"
+      echo "$hits" ;;
+  esac
+}
+
+# --- is an agent running in the pane? -------------------------------------
+# After an agent exits, a bare shell stays in the pane. Anything typed there
+# would RUN as a command. So look at the processes under the pane shell:
+# claude / codex / agy (or the harness name of 'ta run') as the command, or as
+# the script of an interpreter (the 1st or 2nd word of its command line).
+has_agent() {
+  local p="$1" pid harness
+  pid=$(T display -p -t "$p" '#{pane_pid}')
+  harness=$(T display -p -t "$p" '#{@ta_harness}')
+  ps -A -o pid=,ppid=,args= | awk -v root="$pid" -v extra="$harness" '
+    function base(w) { sub(".*/", "", w); return w }
+    function is_agent(w) { return w == "claude" || w == "codex" || w == "agy" || (extra != "" && w == extra) }
+    { parent[$1] = $2
+      if (is_agent(base($3)) || is_agent(base($4))) cand[$1] = 1 }
+    END {
+      for (c in cand) {              # is the pane shell an ancestor of (or equal to) c?
+        p = c
+        for (i = 0; i < 64 && p != "" && p != 0; i++) {
+          if (p == root) found = 1
+          p = parent[p]
+        }
+      }
+      exit !found                    # no early exit: ps must finish writing (pipefail)
+    }'
+}
+
+# require_agent <pane> <label>: die if the pane is alive but runs no agent.
+# Tries 3 times: right after 'ta run' the agent process may not exist yet.
+# A dead pane is fine here: its status is "exited".
+require_agent() {
+  local p="$1" label="$2" try=0
+  [ "$(T display -p -t "$p" '#{pane_dead}')" = 1 ] && return 0
+  while [ $try -lt 3 ]; do
+    has_agent "$p" && return 0
+    sleep 0.3; try=$((try + 1))
+  done
+  die "no agent runs in $label (a bare shell). Start one with 'ta agent start' or 'ta run'."
+}
+
+# --- status (guessed from the screen) ------------------------------------
+status_of() {
+  local p="$1" screen
+  [ "$(T display -p -t "$p" '#{pane_dead}')" = 1 ] && { echo exited; return; }
+  has_agent "$p" || { echo exited; return; }      # bare shell: the agent is gone
+  # Drop the empty lines at the bottom first: on a tall pane the last 30 rows
+  # can all be empty, and the working / blocked text is above them.
+  screen=$(T capture-pane -p -J -t "$p" | awk 'NF{for(;b>0;b--)print "";print;next}{b++}' | tail -n 30)
+  if echo "$screen" | grep -Eq "$TA_BLOCKED_RE"; then echo blocked
+  elif echo "$screen" | grep -Eq "$TA_WORKING_RE"; then echo working
+  else echo idle; fi
+}
+
+# --- commands ------------------------------------------------------------
+cmd_run() {
+  local name="" dir="$PWD" session="" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) name="$2"; shift 2 ;;
+      -C) dir="$2"; shift 2 ;;
+      -s) session="$2"; shift 2 ;;
+      --keep) keep=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || die "run: give a harness or command"
+  local harness="$1"; shift
+  local task="${*:-}"
+  [ -n "$name" ] || name="$harness-$(date +%H%M%S)"
+  if [ -z "$session" ]; then
+    session=$(basename "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "$dir")")
+  fi
+  session=$(echo "$session" | tr '.:' '__')
+  dir=$(cd "$dir" && pwd -P)
+  reg_has "$name" "$session" && die "agent '$name' is already in session '$session'"
+
+  # Interactive start, task as the first prompt.
+  # Claude takes our own session id. Codex and agy make one; a background
+  # finder records it when their session file shows up.
+  local sid="" find=0
+  local -a cmd
+  case "$harness" in
+    claude) sid=$(uuidgen | tr 'A-Z' 'a-z')
+            cmd=(claude --session-id "$sid" -n "$name"); [ -n "$task" ] && cmd+=("$task") ;;
+    codex)  cmd=(codex);    [ -n "$task" ] && cmd+=("$task"); find=1 ;;
+    agy)    cmd=(agy);      [ -n "$task" ] && cmd+=(-i "$task"); find=1 ;;
+    *)      cmd=("$harness" "$@") ;;
+  esac
+
+  local mark="$STATE/.mark-$$"; touch "$mark"
+  reg_add "$name" "$session" "$dir" "$(basename "$harness")" "$sid"
+  launch "$name" "$session" "$dir" "$(basename "$harness")" "$keep" "${cmd[@]}"
+  if [ "$find" = 1 ]; then
+    nohup "$TA_BIN" _find "$harness" "$name" "$session" "$dir" "$mark" >/dev/null 2>&1 &
+  else
+    rm -f "$mark"
+  fi
+}
+
+# launch <name> <session> <dir> <harness> <keep> <cmd...>: new window.
+# The agent runs inside a small bash wrapper: when it exits with code 0
+# (a normal /exit), its registry line is removed. When tmux dies, the
+# wrapper dies too, so the line stays and 'ta restore' can bring it back.
+launch() {
+  local name="$1" session="$2" dir="$3" harness="$4" keep="$5"; shift 5
+  local parent="${TMUX_PANE:-}" pane
+  local -a env=(-e "TA_NAME=$name" -e "TA_SESSION=$session" -e "TA_BIN=$TA_BIN")
+  [ -n "${TA_SOCKET:-}" ] && env+=(-e "TA_SOCKET=$TA_SOCKET")
+  [ -n "$parent" ] && env+=(-e "TA_PARENT=$parent")
+  local wrap='"$@"; rc=$?; [ $rc -eq 0 ] && "$TA_BIN" forget "$TA_NAME" "$TA_SESSION"; exit $rc'
+  if T has-session -t "=$session" 2>/dev/null; then
+    pane=$(T new-window -d -P -F '#{pane_id}' -t "=$session:" -n "$name" -c "$dir" "${env[@]}" bash -c "$wrap" ta "$@")
+  else
+    pane=$(T new-session -d -P -F '#{pane_id}' -s "$session" -n "$name" -c "$dir" "${env[@]}" bash -c "$wrap" ta "$@")
+  fi
+  T set -p -t "$pane" @ta_name "$name"
+  T set -p -t "$pane" @ta_harness "$harness"
+  T set -w -t "$pane" automatic-rename off
+  [ -n "$parent" ] && T set -p -t "$pane" @ta_parent "$parent"
+  [ "$keep" = 1 ] && T set -p -t "$pane" remain-on-exit on
+  echo "$pane"
+}
+
+# --- registry: 1 line per live agent --------------------------------------
+# name <TAB> session <TAB> dir <TAB> harness <TAB> session_id <TAB> started
+reg_has() { awk -F'\t' -v n="$1" -v s="$2" '$1==n&&$2==s{f=1}END{exit !f}' "$REG"; }
+reg_add() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$(date '+%Y-%m-%d %H:%M')" >> "$REG"; }
+reg_del() { awk -F'\t' -v n="$1" -v s="$2" '!($1==n&&$2==s)' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"; }
+reg_set_sid() {
+  awk -F'\t' -v OFS='\t' -v n="$1" -v s="$2" -v id="$3" '$1==n&&$2==s{$5=id}1' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
+}
+reg_ids() { cut -f5 "$REG"; }
+
+# _find <harness> <name> <session> <dir> <mark>: wait (max 30 min) for the
+# new session file of codex / agy, then record its id.
+cmd_find() {
+  local harness="$1" name="$2" session="$3" dir="$4" mark="$5" i=0 f id cwd
+  while [ $i -lt 900 ]; do
+    reg_has "$name" "$session" || break        # agent already gone
+    case "$harness" in
+      codex)
+        for f in $(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -newer "$mark" 2>/dev/null); do
+          id=$(head -1 "$f" | python3 -I -c 'import sys,json;p=json.loads(sys.stdin.readline())["payload"];print(p["id"]+"\t"+p.get("cwd",""))' 2>/dev/null) || continue
+          cwd="${id#*	}"; id="${id%%	*}"
+          [ "$cwd" = "$dir" ] || continue
+          reg_ids | grep -qx "$id" && continue
+          reg_set_sid "$name" "$session" "$id"; rm -f "$mark"; return 0
+        done ;;
+      agy)
+        for f in $(find "$HOME/.gemini/antigravity-cli/conversations" -name '*.db' -newer "$mark" 2>/dev/null); do
+          id=$(basename "$f" .db)
+          reg_ids | grep -qx "$id" && continue
+          reg_set_sid "$name" "$session" "$id"; rm -f "$mark"; return 0
+        done ;;
+    esac
+    sleep 2; i=$((i + 1))
+  done
+  rm -f "$mark"
+}
+
+# restore [--dry-run]: start again every registry agent that has no window.
+cmd_restore() {
+  local dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  local name session dir harness sid started n=0
+  local live; live=$(T list-panes -a -F '#{@ta_name}	#{session_name}' 2>/dev/null || true)
+  cp "$REG" "$REG.bak"
+  while IFS='	' read -r name session dir harness sid started; do
+    [ -n "$name" ] || continue
+    if printf '%s\n' "$live" | grep -qxF "$name	$session"; then continue; fi
+    local -a cmd=()
+    case "$harness" in
+      claude) [ -n "$sid" ] && cmd=(claude --resume "$sid" -n "$name") ;;
+      codex)  [ -n "$sid" ] && cmd=(codex resume "$sid") ;;
+      agy)    [ -n "$sid" ] && cmd=(agy --conversation "$sid") ;;
+    esac
+    if [ ${#cmd[@]} -eq 0 ]; then
+      echo "skip  $session:$name ($harness): no session id recorded"; continue
+    fi
+    echo "start $session:$name -> ${cmd[*]}  (in $dir)"
+    n=$((n + 1))
+    [ "$dry" = 1 ] && continue
+    launch "$name" "$session" "$dir" "$harness" 0 "${cmd[@]}" >/dev/null
+  done < "$REG.bak"
+  rm -f "$REG.bak"
+  echo "$n agent(s) $([ "$dry" = 1 ] && echo 'to restore' || echo 'restored')"
+}
+
+cmd_agents() { printf 'NAME\tSESSION\tHARNESS\tSESSION_ID\tSTARTED\tDIR\n'; awk -F'\t' -v OFS='\t' '{print $1,$2,$4,($5==""?"-":$5),$6,$3}' "$REG"; }
+
+cmd_ls() {
+  local all=0; [ "${1:-}" = "--all" ] && all=1
+  printf '%-5s %-28s %-8s %-8s %-6s %s\n' ID PLACE HARNESS STATUS PARENT DIR
+  T list-panes -a -F '#{pane_id}|#{session_name}:#{window_name}|#{@ta_harness}|#{@ta_parent}|#{pane_current_path}|#{pane_dead}' \
+  | while IFS='|' read -r id place h par dir dead; do
+      [ -z "$h" ] && [ "$all" = 0 ] && continue
+      st=$(status_of "$id")
+      # A live pane with no agent (the agent exited) is not an agent: hide it.
+      [ "$st" = exited ] && [ "$dead" != 1 ] && [ "$all" = 0 ] && continue
+      printf '%-5s %-28s %-8s %-8s %-6s %s\n' "$id" "$place" "${h:--}" "$st" "${par:--}" "${dir/#$HOME/~}"
+    done
+}
+
+# Agents grouped by workspace (made by ta_ws.py). `ta ls` stays flat: tools parse it.
+cmd_tree() {
+  TA_WORKING_RE="$TA_WORKING_RE" TA_BLOCKED_RE="$TA_BLOCKED_RE" TA_SOCKET="${TA_SOCKET:-}" \
+    python3 -I "$(dirname "$TA_BIN")/ta_ws.py" agents-tree
+}
+
+# Live list. q, Esc or Ctrl-C closes it (a key press also works in the popup).
+cmd_top() {
+  local key=""
+  trap 'exit 0' INT
+  while :; do
+    clear; date '+%H:%M:%S   q / Esc = close'; cmd_tree
+    # Wait up to 2 s for 1 key instead of sleep, so q works at once.
+    if IFS= read -rsn1 -t 2 key; then
+      case "$key" in q|Q|$'\e') exit 0 ;; esac
+    fi
+  done
+}
+
+cmd_read() {
+  local p; p=$(resolve "$1"); local n="${2:-60}"
+  # Drop the empty lines below the prompt.
+  T capture-pane -p -J -t "$p" -S "-$n" | awk 'NF{for(;b>0;b--)print "";print;next}{b++}'
+}
+
+cmd_send() {
+  local wait=0; [ "${1:-}" = "--wait" ] && { wait=1; shift; }
+  local target="$1" p; p=$(resolve "$1"); shift
+  local text="$*"
+  [ -n "$text" ] || die "send: empty message"
+  require_agent "$p" "$target"
+  local st; st=$(status_of "$p")
+  # Never type into a permission / question prompt: a person decides there.
+  # Opt out (you accept the risk): TA_ALLOW_BLOCKED=1
+  [ "$st" = blocked ] && [ "${TA_ALLOW_BLOCKED:-0}" != 1 ] && die "$target is blocked (permission or question). Read it with 'ta read' and ask the user. (Opt out: TA_ALLOW_BLOCKED=1)"
+  [ "$st" = exited ] && die "target has exited"
+  if [ -n "${TMUX_PANE:-}" ]; then
+    text="<ta from=\"$TMUX_PANE ${TA_NAME:-}\" reply=\"ta send $TMUX_PANE ...\">$text</ta>"
+  fi
+  local buf="ta-$$"
+  T set-buffer -b "$buf" -- "$text"
+  T paste-buffer -p -d -b "$buf" -t "$p"   # -p: bracketed paste if the app asks for it
+  sleep 0.2
+  # The agent can ask a question while we type. Check again right before Enter.
+  [ "${TA_ALLOW_BLOCKED:-0}" != 1 ] && [ "$(status_of "$p")" = blocked ] && \
+    die "$target became blocked while the text was typed. Enter NOT pressed (the text is still typed there). Read it with 'ta read' and ask the user."
+  T send-keys -t "$p" Enter
+  echo "sent to $p"
+  # --wait: start waiting at once, so a fast answer is not missed.
+  [ "$wait" = 1 ] && cmd_wait "$p" 180
+  return 0
+}
+
+# Ends when the target leaves "working" (after it started), is blocked,
+# exits, or the time is up. Same rule as herdr's wait.
+cmd_wait() {
+  local p; p=$(resolve "$1"); local limit="${2:-180}" waited=0 seen=0 st
+  require_agent "$p" "$1"
+  while [ "$waited" -lt "$limit" ]; do
+    st=$(status_of "$p")
+    case "$st" in
+      working) seen=1 ;;
+      blocked|exited) echo "$st"; return 0 ;;
+      idle) if [ "$seen" = 1 ]; then echo done; return 0; fi
+            [ "$waited" -ge 10 ] && { echo "idle (no work seen)"; return 0; } ;;
+    esac
+    sleep 1; waited=$((waited + 1))
+  done
+  echo "timeout ($st)"   # a check-in, not a failure
+}
+
+# Esc on a permission prompt answers it ("no"). A person decides there, so
+# refuse when blocked. --force is for a person at a shell, never for an agent.
+cmd_stop() {
+  local force=0; [ "${1:-}" = "--force" ] && { force=1; shift; }
+  [ $# -ge 1 ] || die "stop: give a target"
+  local p; p=$(resolve "$1")
+  require_agent "$p" "$1"
+  [ "${TA_ALLOW_BLOCKED:-0}" = 1 ] && force=1
+  if [ "$force" = 0 ] && [ "$(status_of "$p")" = blocked ]; then
+    die "$1 is blocked (permission or question). Esc would answer it. Read it with 'ta read' and ask the user."
+  fi
+  T send-keys -t "$p" Escape; echo "Esc sent to $p"
+}
+cmd_kill() {
+  local p; p=$(resolve "$1")
+  reg_del "$(T display -p -t "$p" '#{@ta_name}')" "$(T display -p -t "$p" '#{session_name}')"
+  T kill-pane -t "$p"; echo "closed $p"
+}
+
+# ta [name] / ta attach [name]: 1 command to start or open tmux, like `herdr`.
+# - tmux runs: open it (the last workspace, or <name>; made if missing).
+# - tmux does not run: build the workspaces again from the last snapshot
+#   (agents typed, not started), else make workspace "main". Then open it.
+# - Already inside tmux: switch to <name>, or say how to leave.
+cmd_up() {
+  local name="${1:-}"
+  if [ -n "${TMUX:-}" ]; then
+    [ -n "$name" ] || { echo "You are inside tmux already. Ctrl-b d = leave (all keeps running)."; return 0; }
+    T has-session -t "=$name" 2>/dev/null || T new-session -d -s "$name" -c "$PWD"
+    T switch-client -t "=$name"; return 0
+  fi
+  if ! T ls >/dev/null 2>&1; then
+    if TA_SOCKET="${TA_SOCKET:-}" python3 -I "$(dirname "$TA_BIN")/ta_ws.py" restore 2>/dev/null; then
+      echo "Restored. Agents are typed, not started: press Enter in their panes."
+      sleep 2
+    else
+      T new-session -d -s main -c "$HOME"
+    fi
+  fi
+  if [ -n "$name" ]; then
+    T has-session -t "=$name" 2>/dev/null || T new-session -d -s "$name" -c "$PWD"
+    exec tmux ${TA_SOCKET:+-L "$TA_SOCKET"} attach -t "=$name"
+  fi
+  exec tmux ${TA_SOCKET:+-L "$TA_SOCKET"} attach
+}
+
+
+# ta doctor: check that everything ta needs is there.
+cmd_doctor() {
+  local bad=0
+  ok()   { printf '  ok    %s\n' "$*"; }
+  warn() { printf '  warn  %s\n' "$*"; }
+  fail() { printf '  FAIL  %s\n' "$*"; bad=1; }
+  echo "ta doctor"
+  if command -v tmux >/dev/null 2>&1; then
+    v=$(tmux -V | sed 's/[^0-9.]//g'); maj=${v%%.*}
+    if [ "${maj:-0}" -ge 3 ]; then ok "tmux $v"; else fail "tmux $v is too old (need 3.0 or newer)"; fi
+  else fail "tmux not found (macOS: brew install tmux)"; fi
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys;sys.exit(sys.version_info<(3,8))'; then
+    ok "python3 $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+  else fail "python3 3.8 or newer not found"; fi
+  for h in claude codex agy; do
+    if command -v "$h" >/dev/null 2>&1; then ok "agent CLI: $h"; else warn "agent CLI not found: $h (optional, install the ones you use)"; fi
+  done
+  [ -f "$(dirname "$TA_BIN")/ta_ws.py" ] && [ -f "$(dirname "$TA_BIN")/ta_hd.py" ] && ok "helper files found" || fail "ta_ws.py / ta_hd.py missing next to ta"
+  if grep -qs 'ta-tmux\|tmux-agents\|ta/tmux.conf' "$HOME/.tmux.conf" 2>/dev/null; then ok "~/.tmux.conf loads tmux.conf"; else warn "~/.tmux.conf does not load ta's tmux.conf (run ./install.sh)"; fi
+  [ "${TA_ALLOW_BLOCKED:-0}" = 1 ] && warn "TA_ALLOW_BLOCKED=1: agents can answer each other's permission prompts"
+  [ "$bad" = 0 ] && echo "all required checks passed" || { echo "fix the FAIL lines above"; return 1; }
+}
+
+# No arguments = start or open tmux (like running `herdr`).
+if [ $# -eq 0 ]; then cmd_up; exit; fi
+sub="$1"; shift
+case "$sub" in
+  attach|start|up) cmd_up "$@" ;;
+  run) cmd_run "$@" ;;
+  ls) cmd_ls "$@" ;;
+  top) cmd_top ;;
+  status) p=$(resolve "$1"); require_agent "$p" "$1"; status_of "$p" ;;
+  read) cmd_read "$@" ;;
+  send) cmd_send "$@" ;;
+  wait) cmd_wait "$@" ;;
+  stop) cmd_stop "$@" ;;
+  kill) cmd_kill "$@" ;;
+  agents) cmd_agents ;;
+  restore) cmd_restore "$@" ;;
+  forget) reg_del "$1" "$2" ;;
+  fix) export TA_SOCKET="${TA_SOCKET:-}"
+      exec python3 -I "$(dirname "$TA_BIN")/ta_ws.py" fix "$@" ;;
+  ws) export TA_WORKING_RE TA_BLOCKED_RE TA_SOCKET="${TA_SOCKET:-}"
+      exec python3 -I "$(dirname "$TA_BIN")/ta_ws.py" "$@" ;;
+  agent|workspace|tab|pane) export TA_WORKING_RE TA_BLOCKED_RE TA_SOCKET="${TA_SOCKET:-}"
+      exec python3 -I "$(dirname "$TA_BIN")/ta_hd.py" "$sub" "$@" ;;
+  _find) cmd_find "$@" ;;
+  doctor) cmd_doctor ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
