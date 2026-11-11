@@ -1,9 +1,13 @@
 # ta: AI coding agents in plain tmux
 
+> **This is a take on [herdr](https://herdr.dev), rebuilt on plain tmux.**
+> It copies herdr's workflow (workspaces, tabs, sidebar, agent status, an agent CLI
+> that agents can drive) but runs on tmux only: no extra app, no daemon, no hooks.
+> It is not affiliated with herdr.
+
 `ta` is a small command-line layer on top of [tmux](https://github.com/tmux/tmux).
 It lets you start, watch, message and restore AI coding agents
-(Claude Code, Codex, agy), each in its own tmux window. Inspired by
-[herdr](https://herdr.dev). No daemon, no hooks, no plugins, nothing written to
+(Claude Code, Codex, agy), each in its own tmux window. Nothing is written to
 your agents' config.
 
 - **Workspaces, tabs, panes** = tmux sessions, windows, panes. A sidebar and tab bar show them.
