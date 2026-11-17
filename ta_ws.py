@@ -55,7 +55,18 @@ BLOCKED_RE = re.compile(ere_to_python(os.environ.get("TA_BLOCKED_RE", "Do you wa
 
 def tmux(*args, check=True):
     cmd = ["tmux"] + (["-L", SOCKET] if SOCKET else []) + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    for attempt in range(4):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            break
+        except OSError:
+            # "Resource temporarily unavailable": the machine is too busy to start
+            # a process. Wait a little and try again. Do not crash the sidebar.
+            if attempt == 3:
+                if check:
+                    sys.exit("ta ws: tmux: cannot start a process (machine overloaded)")
+                return ""
+            time.sleep(0.2 * (attempt + 1))
     if check and result.returncode != 0:
         sys.exit(f"ta ws: tmux {' '.join(args[:2])}: {result.stderr.strip()}")
     return result.stdout
@@ -183,6 +194,83 @@ def status_of(pane_id):
     if WORKING_RE.search(screen):
         return "working"
     return "idle"
+
+
+# --- self-reported Claude status (no screen text, no hooks) -------------------
+# `claude agents --json --all` lists every Claude session with its own state.
+# One call answers for all panes. The result is cached for CACHE_SECONDS so that
+# many sidebars / status bars share one call.
+
+CACHE_SECONDS = 2.0
+AGENTS_CACHE = STATE / "claude-agents.json"
+
+
+def claude_state_to_status(item):
+    """Map one `claude agents --json` entry to blocked | working | idle."""
+    state, status = item.get("state"), item.get("status")
+    if state == "blocked" or status == "waiting":
+        return "blocked"
+    if state == "working" or status == "busy":
+        return "working"
+    return "idle"
+
+
+def claude_status_by_pid():
+    """{pid: status} for running interactive Claude sessions. {} if unavailable."""
+    try:
+        if time.time() - AGENTS_CACHE.stat().st_mtime < CACHE_SECONDS:
+            return {int(k): v for k, v in json.loads(AGENTS_CACHE.read_text()).items()}
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["claude", "agents", "--json", "--all"], capture_output=True,
+                             text=True, timeout=4).stdout
+        items = json.loads(out)
+        result = {int(i["pid"]): claude_state_to_status(i) for i in items
+                  if isinstance(i, dict) and isinstance(i.get("pid"), int)}
+    except (OSError, ValueError, subprocess.SubprocessError, TypeError):
+        return {}
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        tmp = AGENTS_CACHE.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(result))
+        os.replace(tmp, AGENTS_CACHE)
+    except OSError:
+        pass
+    return result
+
+
+# "ready" = an agent finished or waits for you and you have not looked yet.
+# Looking at its pane makes it "seen" and it is shown as idle again.
+SEEN_FILE = STATE / "seen.json"
+
+
+def update_seen(panes, active_pane):
+    """Set p["shown"] on each agent pane: blocked | working | ready | idle."""
+    try:
+        state = json.loads(SEEN_FILE.read_text())
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    current = {}
+    for p in panes:
+        if not p["status"]:
+            continue
+        key = f"{p['harness']}:{p['pane_id']}"
+        status = p["status"]
+        if status == "idle" and (state.get(key) in (None, "seen") or p["pane_id"] == active_pane):
+            status = "seen"
+        current[key] = status
+        p["shown"] = "ready" if status == "idle" else ("idle" if status == "seen" else status)
+    if current != state:
+        try:
+            STATE.mkdir(parents=True, exist_ok=True)
+            tmp = SEEN_FILE.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(current))
+            os.replace(tmp, SEEN_FILE)
+        except OSError:
+            pass
 
 
 # --- snapshot ----------------------------------------------------------------
@@ -508,6 +596,8 @@ def pane_agents():
     """All panes (no sidebars), each with its agent and status ("" = no agent)."""
     table = process_table()
     kids = children_of(table)
+    claude_status = claude_status_by_pid() if any(
+        "claude" in args for _, _, args in table.values()) else {}
     rows = tmux_rows("list-panes", ["session_name", "window_id", "window_index", "window_name",
                                     "window_active", "pane_id", "pane_index", "pane_active",
                                     "pane_pid", "pane_dead", "automatic-rename",
@@ -518,7 +608,11 @@ def pane_agents():
             continue
         agent = None if p["pane_dead"] == "1" else find_agent(int(p["pane_pid"]), table, kids)
         p["harness"] = agent[0] if agent else ""
-        p["status"] = status_of(p["pane_id"]) if agent else ""
+        if agent and agent[0] == "claude" and agent[1] in claude_status:
+            p["status"] = claude_status[agent[1]]          # self-reported by Claude
+        else:
+            p["status"] = status_of(p["pane_id"]) if agent else ""   # screen text
+        p["shown"] = p["status"]
         result.append(p)
     return result
 
@@ -527,9 +621,10 @@ def agent_states(panes=None):
     """session name -> {"working": n, "blocked": n, "idle": n} for agent panes."""
     states = {}
     for p in panes if panes is not None else pane_agents():
-        counts = states.setdefault(p["session_name"], {"working": 0, "blocked": 0, "idle": 0})
+        counts = states.setdefault(p["session_name"],
+                                   {"working": 0, "blocked": 0, "ready": 0, "idle": 0})
         if p["status"]:
-            counts[p["status"]] += 1
+            counts[p.get("shown", p["status"])] += 1
     return states
 
 
@@ -587,8 +682,37 @@ def cmd_bar(args):
 # workspace, so the sidebar follows you. `ta ws sidebar toggle` (prefix e).
 
 SIDE_WIDTH = 30
-STATUS_MARK = {"working": "\x1b[32m●\x1b[0m", "blocked": "\x1b[30;43m!\x1b[0m",
-               "idle": "\x1b[2m○\x1b[0m"}
+MARK_CHAR = {"blocked": "!", "working": "●", "ready": "✓"}
+STATUS_MARK = {"working": "\x1b[33m●\x1b[0m", "blocked": "\x1b[1;31m!\x1b[0m",
+               "ready": "\x1b[36m✓\x1b[0m", "idle": "\x1b[2m○\x1b[0m"}
+# 256-colour numbers. Override with tmux options, e.g. `set -g @ta_color_ready 6`
+# (needs / working / ready / current). Idle has no colour: it is dimmed.
+PALETTE = {"blocked": "1", "working": "3", "ready": "6", "current": "4"}
+PALETTE_OPTIONS = {"blocked": "@ta_color_needs", "working": "@ta_color_working",
+                   "ready": "@ta_color_ready", "current": "@ta_color_current"}
+
+
+def set_palette(values):
+    """values: option texts in PALETTE_OPTIONS order. Bad or empty values keep the default."""
+    for key, value in zip(PALETTE_OPTIONS, values):
+        if value.isdecimal() and int(value) < 256:
+            PALETTE[key] = value
+    for key in ("blocked", "working", "ready"):
+        bold = "1;" if key == "blocked" else ""
+        STATUS_MARK[key] = f"\x1b[{bold}38;5;{PALETTE[key]}m{MARK_CHAR[key]}\x1b[0m"
+
+
+def name_style(status, current):
+    """Colour code for the agent name: current = blue, needs/working/ready = their
+    colour, idle = dim."""
+    if current:
+        return f"\x1b[1;38;5;{PALETTE['current']}m"
+    if status in ("blocked", "working", "ready"):
+        return f"\x1b[1;38;5;{PALETTE[status]}m"
+    return "\x1b[2m"
+
+
+STATUS_ORDER = {"blocked": 0, "working": 1, "ready": 2, "idle": 3}   # most urgent first
 
 
 def sidebar_on():
@@ -673,8 +797,8 @@ def cmd_fix(_args):
         # A fixed size (left by a restore or resize-window) stops a tab from
         # following the terminal size. Unset it, so the tab fits again.
         tmux("set-option", "-wu", "-t", w["window_id"], "window-size", check=False)
-    for c in tmux_rows("list-clients", ["window_id"]):
-        ensure_side(c["window_id"])
+    for w in tmux_rows("list-windows", ["window_id"]):   # every tab, not only the shown ones:
+        ensure_side(w["window_id"])                      # a tab without one shifts when opened
     for line in fixed:
         print(line)
     print(f"layout fixed ({len(fixed)} extra sidebars closed). "
@@ -775,43 +899,48 @@ def agent_short_name(pane):
     return pane.get("@ta_name") or pane["harness"]
 
 
-def agent_title(pane, tab_count, width):
-    """Line 1 text of an agent: "<mark> <workspace>[ · <tab>]", cut to the width.
-    The tab part shows only when the workspace has more than 1 tab. A tab name
-    set by hand wins; an automatic name (program name) says nothing, so use the index."""
-    title = f"{pane['session_name']}"
+def agent_row(pane, tab_count, width, current=False):
+    """One line per agent: "<›><mark> <workspace>[ · <tab>] <name>", whole row coloured
+    by status (current row blue, idle dim), cut to the width. The tab part shows only
+    when the workspace has more than 1 tab. A tab name set by hand wins; an automatic
+    name says nothing, so use the index."""
+    title = pane["session_name"]
     if tab_count > 1:
         by_hand = pane.get("automatic-rename") == "0"
         title += f" \u00b7 {pane['window_name'] if by_hand else pane['window_index']}"
-    name_w = width - 3                           # 1 space + mark + 1 space
-    if visible_cols(title) > name_w:             # cut 1 column short to fit the ellipsis
-        title = cut_pad(title, name_w - 1).rstrip() + "\u2026"
-    return f" {STATUS_MARK[pane['status']]} \x1b[1m{cut_pad(title, name_w).rstrip()}\x1b[0m"
+    short = agent_short_name(pane)
+    if short == pane["harness"]:
+        title += f" \u00b7 {short}"             # default name: workspace first
+    elif short and short != title:
+        title = f"{short} \u00b7 {title}"       # a name you chose: it goes first
+    text_w = width - 4                           # marker + mark + 2 spaces
+    if visible_cols(title) > text_w:             # cut 1 column short to fit the ellipsis
+        title = cut_pad(title, text_w - 1).rstrip() + "\u2026"
+    marker = f"\x1b[1;38;5;{PALETTE['current']}m\u203a\x1b[0m" if current else " "
+    style = name_style(pane["shown"], current)
+    return f"{marker}{STATUS_MARK[pane['shown']]} {style}{cut_pad(title, text_w).rstrip()}\x1b[0m"
 
 
 def agent_block(panes, order, width, room, current=None):
-    """AGENTS block lines [(text, action)]; action = pane id. Like herdr: a flat
-    list, 2 lines per agent (workspace + tab, then the short name), in workspace,
-    tab, pane order. `current` = pane id of the pane you are on: both its lines
-    get a highlight. room = max lines. The caller must give room >= 2."""
+    """AGENTS block lines [(text, action)]; action = pane id. One line per agent.
+    Order: the pane you are on first, then needs you, working, ready, idle; tab
+    order inside a group. room = max lines. The caller must give room >= 2."""
     lines = [("\x1b[1m AGENTS\x1b[0m", None)]
     agents = [p for _, _, group in agents_by_workspace(panes, order) for p in
               sorted(group, key=lambda p: (int(p["window_index"]), int(p["pane_index"])))]
     if not agents:
         return lines + [(dim(" (no agents)", width), None)]
+    agents.sort(key=lambda p: (p["pane_id"] != current, STATUS_ORDER[p["shown"]]))
     tab_counts = {}                              # workspace -> number of tabs
     for name, window in {(p["session_name"], p["window_id"]) for p in panes}:
         tab_counts[name] = tab_counts.get(name, 0) + 1
     room = max(room - 1, 0)                      # the AGENTS title line
-    fit = room // 2                              # agents that fit, 2 lines each
+    fit = room
     if len(agents) > fit:                        # keep 1 line for "+N more"
-        fit = max(room - 1, 0) // 2
+        fit = max(room - 1, 0)
     for p in agents[:fit]:
-        title = agent_title(p, tab_counts[p["session_name"]], width)
-        name = f"\x1b[2m   {cut_pad(agent_short_name(p), width - 3).rstrip()}\x1b[0m"
-        if p["pane_id"] == current:
-            title, name = highlight(title, width), highlight(name, width)
-        lines += [(title, p["pane_id"]), (name, p["pane_id"])]
+        lines.append((agent_row(p, tab_counts[p["session_name"]], width, p["pane_id"] == current),
+                      p["pane_id"]))
     if len(agents) > fit:
         lines.append((dim(f" +{len(agents) - fit} more", width), None))
     return lines
@@ -828,18 +957,6 @@ def cmd_agents_tree(_args):
             print(f"  {p['pane_id']:<5} {tab} {p['harness']:<7} {p['status']:<8} {agent_label(p)}")
 
 
-def ws_flags(counts):
-    """Blocked / working counts after a workspace name. Return (colored text, plain width)."""
-    flags, plain = "", ""
-    if counts.get("blocked"):
-        flags += f" {STATUS_MARK['blocked']}{counts['blocked']}"
-        plain += f" !{counts['blocked']}"
-    if counts.get("working"):
-        flags += f" {STATUS_MARK['working']}{counts['working']}"
-        plain += f" ●{counts['working']}"
-    return flags, len(plain)
-
-
 def fit_height(top, bottom, height, width):
     """Return top + bottom as at most `height` lines. If too tall: cut the end of
     `top` and add a dimmed "+N more" (N = hidden lines). If even that is too tall,
@@ -854,33 +971,48 @@ def fit_height(top, bottom, height, width):
     return top[:keep] + [(dim(f" +{len(top) - keep} more", width), None)] + bottom
 
 
-def current_work_pane(me, panes):
+def current_work_pane(window, panes):
     """Pane id of the work pane you are on: the active pane of this sidebar's window.
     When the sidebar itself has focus, no work pane is active; use the first one."""
-    window = tmux("display", "-p", "-t", me, "#{window_id}").strip()
     here = [p for p in panes if p["window_id"] == window]
     active = [p for p in here if p["pane_active"] == "1"] or here[:1]
     return active[0]["pane_id"] if active else None
 
 
-def side_lines(me, width, height=None):
+SIDE_CURRENT = {}        # set by side_lines: the current workspace / agent actions
+
+
+def side_lines(me, width, height=None, focused=False):
     """Build the sidebar text. Return [(text, action)]; action = tmux target or None.
     Actions: "=name:" workspace, "@id" window, "%id" agent pane.
+    Layout like tmux-agent-status-sidebar: WORKSPACES on top, a divider at about
+    half height, AGENTS below, one line each.
     Never more than `height` lines: a longer text scrolls the pane, and then
     a click lands on the wrong line."""
-    my_session = tmux("display", "-p", "-t", me, "#{session_name}").strip()
+    fmt = "\t".join(["#{session_name}", "#{window_id}"] +
+                    ["#{%s}" % o for o in PALETTE_OPTIONS.values()])
+    my_session, my_window, *colors = tmux("display", "-p", "-t", me, fmt).rstrip("\n").split("\t")
+    set_palette(colors)
     panes = pane_agents()
-    states = agent_states(panes)
     order = sessions_in_order(["session_name"])
-    current = current_work_pane(me, panes)
-    ws_lines = [("\x1b[1m WORKSPACES\x1b[0m", None), ("", None)]
+    current = current_work_pane(my_window, panes)
+    update_seen(panes, current)                  # sets p["shown"] (ready / idle)
+    states = agent_states(panes)
+    ws_lines = [("\x1b[1m WORKSPACES\x1b[0m", None)]
+    SIDE_CURRENT.clear()
+    SIDE_CURRENT["agent"] = current
     for n, s in enumerate(order, start=1):
         name = s["session_name"]
-        flags, flags_w = ws_flags(states.get(name, {}))
-        label_w = width - 1 - max(flags_w, 7)    # 1 = the space before the label
-        label = cut_pad(f"{n} {name}", label_w)
-        if name == my_session:
-            ws_lines.append((f"\x1b[7;1m {label}\x1b[0m{flags}".rstrip(), f"={name}:"))
+        counts = states.get(name, {})
+        worst = next((k for k in ("blocked", "working", "ready") if counts.get(k)), None)
+        is_me = name == my_session
+        mark = STATUS_MARK[worst] if worst else " "
+        marker = f"\x1b[1;38;5;{PALETTE['current']}m\u203a\x1b[0m" if is_me else " "
+        style = name_style(worst or "idle", is_me)
+        label = cut_pad(f"{n} {name}", width - 4).rstrip()
+        ws_lines.append((f"{marker}{mark} {style}{label}\x1b[0m", f"={name}:"))
+        if is_me:
+            SIDE_CURRENT["ws"] = f"={name}:"
             tabs = {}
             for p in panes:
                 if p["session_name"] == name:
@@ -888,30 +1020,64 @@ def side_lines(me, width, height=None):
                                      p["window_active"]), []).append(p)
             for (index, window_id, window_name, active), tab_panes in sorted(tabs.items()):
                 # At most 5 marks, so a tab with many agents does not wrap.
-                shown = [STATUS_MARK[p["status"]] for p in tab_panes if p["status"]][:5]
-                marks = "".join(shown)
-                arrow = "▸" if active == "1" else " "
-                text = cut_pad(f"  {arrow}{index} {window_name}", width - 6)
-                ws_lines.append((f"{text} {marks}".rstrip(), window_id))
-        else:
-            ws_lines.append((f" {label}{flags}".rstrip(), f"={name}:"))
-    footer = [("", None), (dim(" click: open   ?: all keys", width), None),
-              (dim(" 1-9: workspace", width), None),
-              (dim(" Ctrl-b e: hide / show", width), None),
-              (dim(" ● work ! wait ○ idle", width), None)]
+                shown = [STATUS_MARK[p["shown"]] for p in sorted(
+                    tab_panes, key=lambda p: STATUS_ORDER.get(p["shown"], 9)) if p["status"]][:5]
+                arrow = "\u25b8" if active == "1" else " "
+                text = cut_pad(f"   {arrow}{index} {window_name}", width - 6)
+                ws_lines.append((f"\x1b[2m{text}\x1b[0m {''.join(shown)}".rstrip(), window_id))
+    if focused:
+        footer = [(dim(" j/k move  Tab section", width), None),
+                  (dim(" Enter open  Esc back", width), None)]
+    else:
+        footer = [(dim(" click or Ctrl-b Tab", width), None),
+                  (dim(" ? keys  1-9 workspace", width), None)]
     height = height if height else 10**6
-    # The agent block gets what is left (1 = the blank line before it).
-    # With less than 2 lines it is dropped: header + 1 line is its minimum.
-    room = height - len(ws_lines) - 1 - len(footer)
-    agents = []
+    body = max(height - len(footer), 4)
+    # The divider sits at half height. Workspaces may push it down, but AGENTS
+    # keeps at least 4 lines (title + 2 agents + "+N more").
+    middle = min(max(len(ws_lines) + 1, body // 2), max(body - 4, 1))
+    top = fit_height(ws_lines, [], middle - 1, width)
+    top += [("", None)] * (middle - 1 - len(top))
+    lines = top + [(dim("\u2500" * width, width), None)]
+    room = body - len(lines)
     if room >= 2:
-        agents = [("", None)] + agent_block(panes, order, width, room, current)
-    lines = fit_height(ws_lines + agents, footer, height, width)
+        lines += agent_block(panes, order, width, room, current)
+    lines += [("", None)] * max(body - len(lines), 0) + footer
     return lines[:height]                        # last guard: never taller than the pane
 
 
+def reverse_row(text, width):
+    """Selected row: reverse video over the full width. Colour codes end with a
+    reset, so reverse is set again after each one."""
+    padded = text + " " * max(width - visible_cols(text), 0)
+    return "\x1b[7m" + padded.replace("\x1b[0m", "\x1b[0m\x1b[7m") + "\x1b[0m"
+
+
+KEY_TOKEN = re.compile(r"\x1b\[[AB]|\x1bO[AB]|\x1b|.", re.S)
+
+
+def open_target(target, me):
+    """Jump to a sidebar action: "%pane", "=session:" or "@window"."""
+    if target.startswith("%"):
+        where = tmux("display", "-p", "-t", target,
+                     "#{session_name}\t#{window_id}", check=False).strip()
+        session, _, window = where.partition("\t")
+        if window:
+            # One tmux process for all 3 steps (";" chains commands).
+            tmux("switch-client", "-t", f"={session}:", ";",
+                 "select-window", "-t", window, ";",
+                 "select-pane", "-t", target, check=False)
+        return                                    # focus is on the agent pane now
+    # Switch, then give the keyboard back to the work pane: 1 process.
+    verb = "switch-client" if target.startswith("=") else "select-window"
+    tmux(verb, "-t", target, ";", "last-pane", "-t", me, check=False)
+
+
 def cmd_side(_args):
-    """The sidebar program. Redraws every 2 s while you can see it."""
+    """The sidebar program. Redraws every 2 s while you can see it.
+    Mouse: click a row. Keyboard (when the sidebar has focus, Ctrl-b Tab):
+    j/k or arrows move, Tab switches WORKSPACES / AGENTS, Enter opens, Esc gives
+    the keyboard back to the work pane."""
     import select
     import termios
     import tty
@@ -922,53 +1088,100 @@ def cmd_side(_args):
     # Hide the cursor; ask the terminal (tmux) to send mouse clicks (SGR mode).
     sys.stdout.write("\x1b[?25l\x1b[?1000h\x1b[?1006h")
     click = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
-    actions = []
-    first = True
+    lines, actions = [], []
+    focused, visible, section = False, False, 0
+    selected = {0: None, 1: None}                # section -> selected action
+    last_check, force = 0.0, True
+
+    def section_actions(n):
+        seen, out = set(), []
+        for a in actions:
+            if a and (a.startswith("%") == bool(n)) and a not in seen:
+                seen.add(a)
+                out.append(a)
+        return out
+
+    def fix_selection():
+        for n in (0, 1):
+            items = section_actions(n)
+            if selected[n] not in items:
+                default = SIDE_CURRENT.get("agent" if n else "ws")
+                selected[n] = default if default in items else (items[0] if items else None)
+
+    def paint():
+        try:
+            width = os.get_terminal_size().columns
+            out = []
+            for text, action in lines:
+                if focused and action and action == selected[1 if action.startswith("%") else 0] \
+                        and action == selected[section]:
+                    text = reverse_row(text, width)
+                out.append(text + "\x1b[K")
+            sys.stdout.write("\x1b[H" + "\n".join(out) + "\x1b[J")
+            sys.stdout.flush()
+        except OSError:
+            pass
+
     try:
         while True:
-            visible = tmux("display", "-p", "-t", me,
-                           "#{&&:#{window_active},#{session_attached}}", check=False).strip()
-            if visible == "1" or first:
-                first = False
-                size = os.get_terminal_size()
-                lines = side_lines(me, size.columns, size.lines)
-                actions = [action for _, action in lines]
-                sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(text for text, _ in lines))
-                sys.stdout.flush()
-            ready, _, _ = select.select([fd], [], [], 2)
+            now = time.time()
+            if force or now - last_check >= 2:
+                force, last_check = False, now
+                state = tmux("display", "-p", "-t", me,
+                             "#{&&:#{window_active},#{session_attached}}\t#{pane_active}",
+                             check=False).strip().split("\t")
+                visible = state[0] == "1"
+                focus_now = visible and state[-1] == "1"
+                if visible or not lines:
+                    try:
+                        size = os.get_terminal_size()
+                        lines = side_lines(me, size.columns, size.lines, focus_now)
+                        actions = [a for _, a in lines]
+                        focused = focus_now
+                        fix_selection()
+                        paint()
+                    except (OSError, ValueError):
+                        pass                # busy machine: skip this redraw, try in 2 s
+            ready, _, _ = select.select([fd], [], [], max(0.05, 2 - (time.time() - last_check)))
             if not ready:
                 continue
             data = os.read(fd, 256).decode(errors="ignore")
             for button, _x, row, kind in click.findall(data):
                 line = int(row) - 1
                 if kind == "M" and button == "0" and 0 <= line < len(actions) and actions[line]:
-                    target = actions[line]
-                    if target.startswith("%"):
-                        where = tmux("display", "-p", "-t", target,
-                                     "#{session_name}\t#{window_id}", check=False).strip()
-                        session, _, window = where.partition("\t")
-                        if window:
-                            tmux("switch-client", "-t", f"={session}:", check=False)
-                            tmux("select-window", "-t", window, check=False)
-                            tmux("select-pane", "-t", target, check=False)
-                        continue                  # focus is on the agent pane now
-                    if target.startswith("="):
-                        tmux("switch-client", "-t", target, check=False)
-                    else:
-                        tmux("select-window", "-t", target, check=False)
-                    # Give the keyboard back to the work pane.
-                    tmux("last-pane", "-t", me, check=False)
-            keys = click.sub("", data)
-            # No "q" key here: people press q to close the help or less,
-            # and it hid every sidebar. Hide it with prefix e only.
-            if "?" in keys:
-                show_help_popup(me)
+                    open_target(actions[line], me)
+                    force = True
+            keys = KEY_TOKEN.findall(click.sub("", data))
+            moved = False
             for key in keys:
-                if key.isdigit() and key != "0":
+                items = section_actions(section)
+                if key in ("j", "\x1b[B", "\x1bOB") and items:
+                    at = items.index(selected[section]) if selected[section] in items else -1
+                    selected[section] = items[min(at + 1, len(items) - 1)]
+                    moved = True
+                elif key in ("k", "\x1b[A", "\x1bOA") and items:
+                    at = items.index(selected[section]) if selected[section] in items else 0
+                    selected[section] = items[max(at - 1, 0)]
+                    moved = True
+                elif key == "\t":
+                    section = 1 - section
+                    moved = True
+                elif key in ("\r", "\n") and selected[section]:
+                    open_target(selected[section], me)
+                    force = True
+                elif key == "\x1b":
+                    tmux("last-pane", "-t", me, check=False)    # give the keyboard back
+                    force = True
+                elif key == "?":
+                    show_help_popup(me)
+                elif key.isdigit() and key != "0":
                     order = sessions_in_order(["session_name"])
                     if int(key) <= len(order):
                         tmux("switch-client", "-t", f"={order[int(key) - 1]['session_name']}:",
                              check=False)
+                        force = True
+            if moved:
+                paint()
     except BaseException:  # also SystemExit (tmux error) and Ctrl-C: log why it stopped
         import traceback
         STATE.mkdir(parents=True, exist_ok=True)
@@ -978,6 +1191,17 @@ def cmd_side(_args):
     finally:
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h")
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def cmd_side_focus(args):
+    """Give the keyboard to the sidebar of a window (prefix Tab). Shows it if hidden."""
+    window = args[0] if args else tmux("display", "-p", "#{window_id}").strip()
+    mine = [p for p in side_panes() if p["window_id"] == window]
+    if not mine:
+        ensure_side(window)
+        mine = [p for p in side_panes() if p["window_id"] == window]
+    if mine:
+        tmux("select-pane", "-t", mine[0]["pane_id"], check=False)
 
 
 # --- key help (prefix ?) -------------------------------------------------------
@@ -1029,7 +1253,8 @@ HELP = [
         ("click", "Open the workspace or tab on that line"),
         ("1-9  (in it)", "Open workspace 1-9"),
         ("click an agent", "Jump to that agent's pane"),
-        ("● ! ○", "Agent working / waiting for you / idle;  ▸ = current tab"),
+        ("Ctrl-b Tab", "Keyboard in the sidebar: j/k or arrows move, Tab = WORKSPACES / AGENTS, Enter opens, Esc back"),
+        ("! ● ✓ ○", "Needs you (red) / working (yellow) / ready, not seen yet (cyan) / idle;  › = you are here"),
     ]),
     ("Agents  (ta)", [
         ("Ctrl-b a", "Live list of agents by workspace (popup; q or Esc closes)"),
@@ -1076,7 +1301,7 @@ def cmd_help(_args):
 
 COMMANDS = {"ls": cmd_ls, "help": cmd_help, "new": cmd_new, "save": cmd_save, "snapshots": cmd_snapshots,
             "restore": cmd_restore, "import-herdr": cmd_import_herdr, "bar": cmd_bar,
-            "sidebar": cmd_sidebar, "side": cmd_side, "side-ensure": cmd_side_ensure, "fix": cmd_fix, "turn": cmd_turn,
+            "sidebar": cmd_sidebar, "side": cmd_side, "side-focus": cmd_side_focus, "side-ensure": cmd_side_ensure, "fix": cmd_fix, "turn": cmd_turn,
             "agents-tree": cmd_agents_tree}
 
 if __name__ == "__main__":

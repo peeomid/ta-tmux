@@ -11,7 +11,7 @@ It lets you start, watch, message and restore AI coding agents
 your agents' config.
 
 - **Workspaces, tabs, panes** = tmux sessions, windows, panes. A sidebar and tab bar show them.
-- **Agent status** (working / blocked / idle) is read from the screen text. No hooks.
+- **Agent status** (blocked / working / ready / idle): Claude reports its own state; Codex and agy are read from screen text. No hooks.
 - **Agents can run other agents**: `ta run`, `ta send`, `ta wait`, `ta read`.
 - **Crash-safe**: after a tmux crash or reboot, `ta` rebuilds your layout and resumes each agent's conversation.
 - Pure bash + Python 3 standard library. Nothing to `pip install`.
@@ -116,8 +116,15 @@ Open the key help inside tmux with `Ctrl-b ?`.
 | `ta ws import-herdr <file> [--only LABEL] [--dry-run] [--start]` | Build workspaces from a herdr `workspaces.json` export. |
 | `Ctrl-b a` (`ta top`) | Live agent list, refresh every 2 s. |
 | `Ctrl-b e` | Show or hide the sidebar. |
+| `Ctrl-b Tab` | Keyboard to the sidebar (`j`/`k`, `Tab`, `Enter`, `Esc`). |
 
-The **sidebar** (left, 30 columns) lists workspaces and agents. `●` = working, `!` = waiting.
+The **sidebar** (left, 30 columns): WORKSPACES on top, a divider, AGENTS below, one line each.
+The pane you are on comes first, then needs you, working, ready, idle. `›` (blue) = you are here.
+`!` red = needs you, `●` yellow = working, `✓` cyan = ready (finished, you have not looked yet), `○` dim = idle.
+Click a row to jump there. Keyboard: `Ctrl-b Tab` moves the keyboard to the sidebar, then
+`j`/`k` or arrows move, `Tab` switches WORKSPACES / AGENTS, `Enter` opens, `Esc` gives the keyboard back.
+`1`-`9` open a workspace. Change colours with tmux options (256-colour numbers):
+`set -g @ta_color_needs 1`, `@ta_color_working 3`, `@ta_color_ready 6`, `@ta_color_current 4`.
 Click a line to jump there. The **tab bar** (top) shows the tabs of the current workspace.
 
 ### herdr-style commands (`ta agent|workspace|tab|pane`)
@@ -136,8 +143,18 @@ A bare shell (no agent) is refused by `send`, `wait`, `stop` and `status`.
 
 ## How status detection works
 
-tmux cannot ask an agent what it is doing, so `ta` **reads the visible screen** and
+**Claude Code**: `ta` runs `claude agents --json --all` (one call, cached 2 s in
+`~/.local/state/ta/claude-agents.json`). Claude reports `busy`, `idle` or `waiting` for
+each session, matched to its pane by process id. This is exact and needs no screen text.
+If that call fails or times out, `ta` falls back to screen matching.
+
+**Codex and agy** cannot be asked, so `ta` **reads the visible screen** and
 matches text patterns. Blocked is checked first.
+
+**Ready**: when an agent goes from working or blocked to idle and you are not on its pane,
+the sidebar shows `✓` until you open that pane (kept in `~/.local/state/ta/seen.json`).
+First sight of an agent counts as seen. The idea comes from
+[tmux-agent-status-sidebar](https://github.com/angadsgrover/tmux-agent-status-sidebar).
 
 | Harness (tested version) | Working | Blocked |
 |---|---|---|
@@ -145,7 +162,7 @@ matches text patterns. Blocked is checked first.
 | codex 0.164 | `• Working (3s • esc to interrupt)` | approval prompt |
 | agy 1.4 | `⣯ Generating...` + `esc to cancel` | `requires permission ... enter Confirm` |
 
-The status is a guess. If an agent update changes its screen text, set
+Screen-text status is a guess. If an agent update changes its screen text, set
 `TA_WORKING_RE` / `TA_BLOCKED_RE` (extended regex) or edit the defaults at the top of `ta`.
 
 ## Session ids and restore
