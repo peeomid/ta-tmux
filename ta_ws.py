@@ -25,6 +25,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -1088,6 +1089,9 @@ def cmd_side(_args):
     # Hide the cursor; ask the terminal (tmux) to send mouse clicks (SGR mode).
     sys.stdout.write("\x1b[?25l\x1b[?1000h\x1b[?1006h")
     click = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+    wake_r, wake_w = os.pipe()                   # SIGUSR1 (a switch happened) wakes select
+    os.set_blocking(wake_w, False)
+    signal.signal(signal.SIGUSR1, lambda *_: os.write(wake_w, b"x"))
     lines, actions = [], []
     focused, visible, section = False, False, 0
     selected = {0: None, 1: None}                # section -> selected action
@@ -1101,10 +1105,10 @@ def cmd_side(_args):
                 out.append(a)
         return out
 
-    def fix_selection():
+    def fix_selection(has_focus):
         for n in (0, 1):
             items = section_actions(n)
-            if selected[n] not in items:
+            if not has_focus or selected[n] not in items:   # unfocused: cursor waits on "you are here"
                 default = SIDE_CURRENT.get("agent" if n else "ws")
                 selected[n] = default if default in items else (items[0] if items else None)
 
@@ -1138,11 +1142,16 @@ def cmd_side(_args):
                         lines = side_lines(me, size.columns, size.lines, focus_now)
                         actions = [a for _, a in lines]
                         focused = focus_now
-                        fix_selection()
+                        fix_selection(focus_now)
                         paint()
                     except (OSError, ValueError):
                         pass                # busy machine: skip this redraw, try in 2 s
-            ready, _, _ = select.select([fd], [], [], max(0.05, 2 - (time.time() - last_check)))
+            ready, _, _ = select.select([fd, wake_r], [], [],
+                                        max(0.05, 2 - (time.time() - last_check)))
+            if wake_r in ready:
+                os.read(wake_r, 64)
+                force = True                     # redraw now
+                continue
             if not ready:
                 continue
             data = os.read(fd, 256).decode(errors="ignore")
@@ -1177,8 +1186,11 @@ def cmd_side(_args):
                 elif key.isdigit() and key != "0":
                     order = sessions_in_order(["session_name"])
                     if int(key) <= len(order):
-                        tmux("switch-client", "-t", f"={order[int(key) - 1]['session_name']}:",
-                             check=False)
+                        # Switch workspace and take the keyboard along: the cursor
+                        # shows on that workspace's row in ITS sidebar.
+                        target = f"={order[int(key) - 1]['session_name']}:"
+                        focus_workspace(target)
+                        selected[0] = target
                         force = True
             if moved:
                 paint()
@@ -1191,6 +1203,29 @@ def cmd_side(_args):
     finally:
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h")
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def focus_workspace(target):
+    """Switch to a workspace and give the keyboard to the sidebar of its tab.
+    Then that sidebar is told to redraw, so its cursor shows at once."""
+    window = tmux("display", "-p", "-t", target, "#{window_id}", check=False).strip()
+    tmux("switch-client", "-t", target, check=False)
+    mine = [p for p in side_panes() if p["window_id"] == window]
+    if mine:
+        tmux("select-pane", "-t", mine[0]["pane_id"], check=False)
+        cmd_side_refresh([window])
+
+
+def cmd_side_refresh(args):
+    """Tell the sidebar of a window to redraw now (hook: you switched workspace or tab).
+    Without this, the sidebar you switch to shows the old state for up to 2 s."""
+    rows = tmux_rows("list-panes", ["pane_pid", "window_id", "@ta_side"])
+    for r in rows:
+        if r["@ta_side"] == "1" and (not args or r["window_id"] == args[0]):
+            try:
+                os.kill(int(r["pane_pid"]), signal.SIGUSR1)
+            except (OSError, ValueError):
+                pass
 
 
 def cmd_side_focus(args):
@@ -1301,7 +1336,7 @@ def cmd_help(_args):
 
 COMMANDS = {"ls": cmd_ls, "help": cmd_help, "new": cmd_new, "save": cmd_save, "snapshots": cmd_snapshots,
             "restore": cmd_restore, "import-herdr": cmd_import_herdr, "bar": cmd_bar,
-            "sidebar": cmd_sidebar, "side": cmd_side, "side-focus": cmd_side_focus, "side-ensure": cmd_side_ensure, "fix": cmd_fix, "turn": cmd_turn,
+            "sidebar": cmd_sidebar, "side": cmd_side, "side-focus": cmd_side_focus, "side-refresh": cmd_side_refresh, "side-ensure": cmd_side_ensure, "fix": cmd_fix, "turn": cmd_turn,
             "agents-tree": cmd_agents_tree}
 
 if __name__ == "__main__":
